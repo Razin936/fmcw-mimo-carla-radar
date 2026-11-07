@@ -16,6 +16,13 @@ carla_radar_sender.py
   3. Streams the raw detections plus the cube to MATLAB over UDP,
      fragmented into magic-tagged packets.
 
+ Threads
+ -------
+  The CARLA sensor callback only copies the detections and returns.
+  A sender thread builds and transmits the cube (keeping only the
+  newest frame if it falls behind), and a separate logger thread
+  writes radar_log.csv, so neither blocks the simulator.
+
  Array model (2 TX x 4 RX -> 8 virtual elements)
  -----------------------------------------------
   RX spacing lambda/2, TX spacing 4*lambda/2, giving a uniform
@@ -51,9 +58,11 @@ carla_radar_sender.py
 
 import carla
 import csv
+import queue
 import random
 import socket
 import struct
+import threading
 import time
 
 import numpy as np
@@ -237,27 +246,85 @@ def send_frame(sock, dets, timestamp, frame_id):
         time.sleep(0.0002)   # pacing so the loopback receive buffer is not overrun
 
 
-frame_id_counter = 0
+class RadarStreamer:
+    """Decouples the CARLA sensor callback from cube synthesis, UDP
+    dispatch and CSV logging.
 
+    - on_radar() runs in CARLA's sensor thread: it copies the detections
+      and returns immediately.
+    - The sender thread keeps only the newest frame (older queued frames
+      are dropped and counted) and sends it.
+    - The logger thread writes every frame to the CSV file.
+    """
 
-def radar_callback(radar_data, sock, csv_writer=None):
-    """CARLA sensor callback: build and send one frame, then log it."""
-    global frame_id_counter
-    ts = float(radar_data.timestamp)
-    dets = detections_to_array(radar_data)
-    send_frame(sock, dets, ts, frame_id_counter)
-    frame_id_counter += 1
+    def __init__(self, sock, csv_writer):
+        self.sock = sock
+        self.csv_writer = csv_writer
+        self.send_q = queue.Queue(maxsize=1)
+        self.log_q = queue.Queue()
+        self.stop_event = threading.Event()
+        self.frame_id = 0
+        self.dropped = 0
+        self.sent = 0
+        self._threads = [
+            threading.Thread(target=self._send_loop, name="radar-sender", daemon=True),
+            threading.Thread(target=self._log_loop, name="radar-logger", daemon=True),
+        ]
 
-    if csv_writer is not None:
-        for v, az, alt, dep in dets:
-            csv_writer.writerow([ts, len(dets), v, az, alt, dep])
+    def start(self):
+        for t in self._threads:
+            t.start()
 
-    if len(dets):
-        v, dep = dets[:, 0], dets[:, 3]
-        print(f"[Radar] t={ts:.2f}s | pts={len(dets)} | nearest={dep.min():.2f}m | "
-              f"vel=[{v.min():.2f}, {v.max():.2f}] | mean={v.mean():.2f} m/s")
-    else:
-        print(f"[Radar] t={ts:.2f}s | pts=0")
+    def on_radar(self, radar_data):
+        item = (float(radar_data.timestamp), detections_to_array(radar_data))
+        try:
+            self.send_q.put_nowait(item)
+        except queue.Full:
+            try:
+                self.send_q.get_nowait()       # discard the older, unsent frame
+                self.dropped += 1
+            except queue.Empty:
+                pass
+            try:
+                self.send_q.put_nowait(item)
+            except queue.Full:
+                self.dropped += 1
+        self.log_q.put(item)
+
+    def _send_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                ts, dets = self.send_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                send_frame(self.sock, dets, ts, self.frame_id)
+                self.frame_id += 1
+                self.sent += 1
+            except OSError as exc:
+                print(f"[Sender] UDP error: {exc}")
+
+    def _log_loop(self):
+        while not (self.stop_event.is_set() and self.log_q.empty()):
+            try:
+                ts, dets = self.log_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if self.csv_writer is not None:
+                for v, az, alt, dep in dets:
+                    self.csv_writer.writerow([ts, len(dets), v, az, alt, dep])
+            if len(dets):
+                v, dep = dets[:, 0], dets[:, 3]
+                print(f"[Radar] t={ts:.2f}s | pts={len(dets)} | nearest={dep.min():.2f}m | "
+                      f"vel=[{v.min():.2f}, {v.max():.2f}] | mean={v.mean():.2f} m/s | "
+                      f"sent={self.sent} dropped={self.dropped}")
+            else:
+                print(f"[Radar] t={ts:.2f}s | pts=0 | sent={self.sent} dropped={self.dropped}")
+
+    def stop(self):
+        self.stop_event.set()
+        for t in self._threads:
+            t.join(timeout=2.0)
 
 
 # ---- Scene helpers -------------------------------------------------
@@ -373,6 +440,7 @@ def spawn_walkers(world, blueprint_library, count):
 def main():
     actors_to_destroy = []
     radar = None
+    streamer = None
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -473,7 +541,9 @@ def main():
         print("Streaming IQ data cube to MATLAB on UDP port 5005 ...")
         print("Press Ctrl+C to stop.")
 
-        radar.listen(lambda data: radar_callback(data, sock, csv_writer))
+        streamer = RadarStreamer(sock, csv_writer)
+        streamer.start()
+        radar.listen(streamer.on_radar)
 
         spectator = world.get_spectator()
         while True:
@@ -497,6 +567,8 @@ def main():
                 radar.stop()
             except Exception:
                 pass
+        if streamer is not None:
+            streamer.stop()
         print("Destroying actors...")
         for actor in actors_to_destroy:
             try:
