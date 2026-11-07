@@ -511,10 +511,11 @@ while all(isvalid(allFigs))
         chan_win          = RDC(:,:,vv) .* win2d;
         rangeFFT(:,:,vv) = fft(chan_win, numADC, 1);
     end
+    dopFFT = fftshift(fft(rangeFFT, numChirps, 2), 2);   % [range x Doppler x virt]
 
     %% Step 13: Fig 4 - Range-Azimuth using dominant Doppler bin  -- FROM V5
     [~, dom_dop_bin] = max(max(abs(RDM), [], 1));
-    virt_snap = squeeze(rangeFFT(:, dom_dop_bin, :));  % [numADC x numVirt]
+    virt_snap = squeeze(dopFFT(:, dom_dop_bin, :));    % [numADC x numVirt]
     ra_map = abs(virt_snap * conj(steer_az));          % [numADC x 181]
     ra_dB  = 20*log10(ra_map ./ (max(ra_map(:)) + eps));
     set(hi_ra, 'CData', ra_dB);
@@ -538,15 +539,15 @@ while all(isvalid(allFigs))
     if numTarFFT > 0
         for k = 1:numTarFFT
             ri       = cfar_r(k);
-            x_snap   = virt_snap(ri, :).';
+            x_snap   = squeeze(dopFFT(ri, cfar_d(k), :));   % own range-Doppler cell
             bf_power = abs(steer_az' * x_snap).^2;
             bf_dB    = 10*log10(bf_power ./ (max(bf_power) + eps));
             set(hl_fft_spec(k), 'YData', bf_dB);
 
             % Ground-truth azimuth from nearest CARLA detection
             if ~isempty(dep_raw)
-                range_of_bin = R_ax(ri);
-                [~, nearest_det] = min(abs(dep_raw - range_of_bin));
+                cost = abs(dep_raw - R_ax(ri))/dR + abs(vel_raw - V_ax(cfar_d(k)))/dV;
+                [~, nearest_det] = min(cost);
                 set(hl_fft_gt(k), 'Value', az_deg(nearest_det));
             end
         end
