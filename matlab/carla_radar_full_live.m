@@ -248,8 +248,18 @@ yline(ax10,-13,':','Color',[0.6 0.6 0.6],'LineWidth',0.8, ...
     'Label','-13 dB ULA sidelobe ref', ...
     'LabelHorizontalAlignment','left','FontSize',8);
 
-drawnow;
 allFigs    = [f1 f2 f3 f4 f5 f6 f7 f8 f9 f10];
+
+%% ---- Window layout -------------------------------------------------------
+% The CARLA window (-ResX=800 -ResY=600 -WinX=0 -WinY=0) sits top-left.
+%   rows 1-2, right of CARLA : Fig 1  Fig 4  Fig 3
+%                              Fig 2  Fig 5  Fig 7
+%   row 3, full width        : Fig 8  Fig 6  Fig 9  Fig 10
+% Change CARLA_AREA if the CARLA window on your screen is larger or smaller.
+CARLA_AREA = [820 650];          % [width height] reserved for CARLA (pixels)
+TASKBAR_H  = 48;                 % Windows taskbar height (pixels)
+tile_figures(allFigs, CARLA_AREA, TASKBAR_H);
+drawnow;
 frameCount = 0;
 last_wall_t     = tic;
 last_num_chunks = 0;
@@ -594,6 +604,42 @@ function [assembled, num_chunks, dropped, prebuf] = receive_frame(u, prebuf, MAG
 
         else
             dropped = dropped + 1;                     % chunk without META, or junk
+        end
+    end
+end
+
+function tile_figures(figs, carla_area, taskbar_h)
+% Place the 10 figure windows around the CARLA window on the first monitor.
+% figs = [f1 ... f10]; positions are outer positions (incl. title bar).
+    mon = get(groot, 'MonitorPositions');
+    scr = mon(1, :);                                  % [left bottom width height]
+    x0 = scr(1);  y0 = scr(2) + taskbar_h;
+    W  = scr(3);  H  = scr(4) - taskbar_h;
+    rowH = floor(H / 3);
+    yTop = y0 + 2*rowH;  yMid = y0 + rowH;  yBot = y0;
+
+    if W - carla_area(1) >= 900 && 2*rowH >= carla_area(2) - 40
+        % Rows 1-2: three columns to the right of CARLA
+        xs = x0 + carla_area(1);
+        colW = floor((W - carla_area(1)) / 3);
+        top = [1 4 3];  mid = [2 5 7];
+        for i = 1:3
+            set(figs(top(i)), 'OuterPosition', [xs + (i-1)*colW, yTop, colW, rowH]);
+            set(figs(mid(i)), 'OuterPosition', [xs + (i-1)*colW, yMid, colW, rowH]);
+        end
+        % Row 3: four columns across the full width
+        bot = [8 6 9 10];  colW4 = floor(W / 4);
+        for i = 1:4
+            set(figs(bot(i)), 'OuterPosition', [x0 + (i-1)*colW4, yBot, colW4, rowH]);
+        end
+    else
+        % Small screen: plain 4 x 3 grid (CARLA may overlap Fig 1)
+        colW4 = floor(W / 4);
+        order = [1 4 3 2 5 7 8 6 9 10];
+        for k = 1:numel(order)
+            r = floor((k-1) / 4);  c = mod(k-1, 4);
+            set(figs(order(k)), 'OuterPosition', ...
+                [x0 + c*colW4, y0 + (2-r)*rowH, colW4, rowH]);
         end
     end
 end
