@@ -1,4 +1,4 @@
-radar_log.csv
+radar_log*.csv
 __pycache__/
 *.pyc
 *.asv

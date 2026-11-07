@@ -71,6 +71,17 @@ PULL_AWAY_S      = 7.0        # s    pull-away phase
 FOLLOW_GAP_M     = 15.0       # m    distance the ego keeps behind it (centre to centre)
 CUT_IN_SIDE      = "left"     # lane the second car comes from: "left" or "right"
 SHOW_LABELS      = True       # phase text above the second car in the CARLA window
+STATUS_EVERY_S   = 1.0        # print speeds and the expected radar velocity this often
+
+# ---- Radar timing --------------------------------------------------
+# CARLA's radar estimates its own velocity from the distance it moved
+# since its last scan, divided by the length of one simulation step.
+# With sensor_tick (0.1 s) longer than the step (0.05 s), the ego
+# velocity is counted twice: a static object straight ahead shows
+# -2 x ego speed, and a car driving at ego speed shows -ego speed.
+# The demo therefore lets the radar scan on every step (same rays per
+# second) and forwards every second scan, so MATLAB still gets 10 Hz.
+RADAR_SCAN_EVERY_STEP = True
 
 EGO_BLUEPRINT    = "vehicle.tesla.model3"
 CUT_IN_BLUEPRINT = "vehicle.audi.a2"
@@ -320,8 +331,15 @@ def main():
         radar_bp.set_attribute("horizontal_fov",    str(radar_io.RADAR_HORIZONTAL_FOV))
         radar_bp.set_attribute("vertical_fov",      str(radar_io.RADAR_VERTICAL_FOV))
         radar_bp.set_attribute("range",             str(radar_io.RADAR_RANGE))
-        radar_bp.set_attribute("points_per_second", str(radar_io.RADAR_POINTS_PER_SECOND))
-        radar_bp.set_attribute("sensor_tick",       str(radar_io.RADAR_SENSOR_TICK))
+        if RADAR_SCAN_EVERY_STEP:
+            steps_per_frame = max(1, int(round(radar_io.RADAR_SENSOR_TICK / dt)))
+            radar_bp.set_attribute("points_per_second",
+                                   str(radar_io.RADAR_POINTS_PER_SECOND * steps_per_frame))
+            radar_bp.set_attribute("sensor_tick", "0.0")      # scan on every step
+        else:
+            steps_per_frame = 1
+            radar_bp.set_attribute("points_per_second", str(radar_io.RADAR_POINTS_PER_SECOND))
+            radar_bp.set_attribute("sensor_tick",       str(radar_io.RADAR_SENSOR_TICK))
         radar = world.spawn_actor(
             radar_bp,
             carla.Transform(carla.Location(x=2.2, z=1.0), carla.Rotation()),
@@ -329,7 +347,14 @@ def main():
         actors.append(radar)
         streamer = radar_io.RadarStreamer(sock, csv_writer)
         streamer.start()
-        radar.listen(streamer.on_radar)
+        scan_count = [0]
+
+        def on_scan(data):                   # forward every n-th scan -> 10 Hz to MATLAB
+            scan_count[0] += 1
+            if scan_count[0] % steps_per_frame == 0:
+                streamer.on_radar(data)
+
+        radar.listen(on_scan)
         print("Streaming IQ data cube to MATLAB on UDP port "
               f"{radar_io.MATLAB_PORT}. Press Ctrl+C to stop.")
 
@@ -337,6 +362,7 @@ def main():
         phase, t_phase = "free", 0.0
         cut_ref = OVERTAKE_SPEED
         t0 = world.get_snapshot().timestamp.elapsed_seconds
+        t_status = t0
         banner(t0, f"FREE ROAD: no vehicle in front of the ego ({FREE_DRIVE_S:.0f} s)")
         next_t = time.perf_counter()
 
@@ -353,6 +379,12 @@ def main():
             i_e, i_c = ego_drv.update_index(), cut_drv.update_index()
             gap = (i_c - i_e) * PATH_SPACING_M           # centre to centre, along the road
             v_ego, v_cut = ego_drv.speed(), cut_drv.speed()
+            if t - t_status >= STATUS_EVERY_S:
+                t_status = t
+                ahead = (f"car ahead {gap - 4.5:5.1f} m, expected radar v {v_cut - v_ego:+5.1f} m/s"
+                         if cut_drv.lane_mix >= 0.5 and gap > 0 else "no car in the ego lane")
+                print(f"[DEMO] t={t:7.2f} s  ego {v_ego:4.1f} m/s  other car {v_cut:4.1f} m/s  "
+                      f"| {ahead} | roadside expected at about {-v_ego:+5.1f} m/s")
 
             # ---- phase logic for the second car ----
             if phase == "free":
