@@ -1,0 +1,7 @@
+radar_log.csv
+__pycache__/
+*.pyc
+*.asv
+*.mat
+.DS_Store
+Thumbs.db
