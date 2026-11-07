@@ -40,3 +40,4 @@ Changes since the initial version **`v0.1.0`**.
   - The spectator camera now sits 8 m behind and 4 m above the ego vehicle; it was 8 m above.
   - The pedestrian crossing factor is now set on `carla.World` before the walkers spawn. Before, the call went to the Traffic Manager and failed silently.
 - **Tests.** Added `test_sender.py` for offline checks.
+- **Cut-in demo.** Added `cut_in_demo.py`: a scripted, repeatable scene in which a car overtakes, cuts in front of the ego vehicle, brakes and pulls away. It uses the same radar and UDP stream as the sender.

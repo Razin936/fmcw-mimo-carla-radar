@@ -17,6 +17,7 @@ flowchart LR
 | Path | What it is |
 |---|---|
 | `python/carla_radar_sender.py` | CARLA scene, detection filter, data-cube synthesis, UDP sender |
+| `python/cut_in_demo.py` | Scripted cut-in scene for demonstrations and screen recordings |
 | `python/test_sender.py` | Offline checks for the sender (no CARLA needed) |
 | `matlab/carla_radar_full_live.m` | UDP receiver and the full radar signal processing chain |
 | `CHANGELOG.md` | What changed since the initial version |
@@ -51,6 +52,29 @@ The ten figure windows arrange themselves around the CARLA window: Fig 1/4/3 and
 - **To stop MATLAB:** close any figure window.
 - **To stop the sender:** press `Ctrl+C` in its terminal.
 - **Recorded detections:** the sender also writes every raw detection to `radar_log.csv`.
+
+### Cut-in demo
+
+`python/cut_in_demo.py` plays a short, repeatable scene instead of random traffic. It uses the same radar, cube and UDP stream, so the MATLAB script runs unchanged. Start MATLAB first, then:
+
+```bash
+cd python
+python cut_in_demo.py
+```
+
+The scene runs in Town04, on a long two-lane road with no other traffic, and takes about 30 s:
+
+1. **Free road:** nothing in front of the ego vehicle. The radar shows only the roadside (static objects at −10 m/s relative velocity).
+2. **Overtake:** a second car passes in the left lane, outside the radar field of view.
+3. **Cut-in:** it changes into the ego lane about 8 m ahead and appears from the side of the field of view.
+4. **Braking:** it slows down, and the ego brakes behind it (a closing target, negative relative velocity).
+5. **Pull away:** it speeds up again (an opening target, positive relative velocity).
+
+The console prints each phase with the simulation time, which matches `t=` in the MATLAB frame log. Speeds, distances and durations are set at the top of the script. `--side right` makes the car come from the right, and `--seed N` picks another stretch of road.
+
+Afterwards, switch CARLA back to the map of the normal scene with `python cut_in_demo.py --load-map Town10HD_Opt` (or restart CARLA).
+
+### Offline test
 
 To check the sender without CARLA:
 
