@@ -49,6 +49,13 @@ carla_radar_sender.py
     bytes 24-    float32 [numDet x 4]  raw detections [vel, az, alt, depth]
     then         complex64 cube [numVirtual x numADC x numChirps] (C order)
 
+ Simulation timing
+ -----------------
+  With USE_SYNC_MODE the script switches CARLA to synchronous mode with
+  a fixed 50 ms step and paces the steps to real time. The scene then
+  moves evenly and every radar frame sees the same time step. The
+  original world settings are restored when the script stops.
+
  How to run
  ----------
   1. Start the CARLA simulator (server on localhost:2000)
@@ -77,6 +84,10 @@ RADAR_HORIZONTAL_FOV    = 30.0
 RADAR_VERTICAL_FOV      = 10.0
 RADAR_POINTS_PER_SECOND = 1500
 RADAR_SENSOR_TICK       = 0.1
+
+# ---- Simulation timing ----------------------------------------------
+USE_SYNC_MODE    = True    # False = CARLA's default asynchronous mode
+SYNC_FIXED_DELTA = 0.05    # s per simulation step (radar fires every 2nd step)
 
 # ---- FMCW MIMO waveform parameters  (77 GHz) ----------------------
 C           = 3e8
@@ -425,6 +436,8 @@ def spawn_walkers(world, blueprint_library, count):
             continue
         walkers.append(walker)
         controllers.append(ctrl)
+    if USE_SYNC_MODE:
+        world.tick()           # walker controllers need one tick before start()
     for walker, ctrl in zip(walkers, controllers):
         ctrl.start()
         ctrl.set_max_speed(3.5 if random.random() < WALKER_RUNNING_PROB else 1.4)
@@ -440,6 +453,7 @@ def main():
     actors_to_destroy = []
     radar = None
     streamer = None
+    original_settings = None
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -456,7 +470,6 @@ def main():
     blueprint_library = world.get_blueprint_library()
     tm                = client.get_trafficmanager(8000)
 
-    tm.set_synchronous_mode(False)
     tm.set_global_distance_to_leading_vehicle(6.0)
     tm.global_percentage_speed_difference(30.0)
     try:
@@ -466,6 +479,17 @@ def main():
         pass
 
     try:
+        if USE_SYNC_MODE:
+            original_settings = world.get_settings()
+            settings = world.get_settings()
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = SYNC_FIXED_DELTA
+            world.apply_settings(settings)
+            tm.set_synchronous_mode(True)
+            print(f"[SYNC] synchronous mode, fixed step {SYNC_FIXED_DELTA} s")
+        else:
+            tm.set_synchronous_mode(False)
+
         vehicle_bps  = blueprint_library.filter("vehicle.*")
         spawn_points = world.get_map().get_spawn_points()
         if not spawn_points:
@@ -482,6 +506,8 @@ def main():
         actors_to_destroy.append(ego)
         print(f"Ego spawned: {ego.type_id}")
         setup_vehicle_behavior(ego, tm, is_ego=True)
+        if USE_SYNC_MODE:
+            world.tick()       # register the ego vehicle before spawning around it
 
         # Lead vehicle
         if SPAWN_LEAD_VEHICLE:
@@ -546,7 +572,19 @@ def main():
         radar.listen(streamer.on_radar)
 
         spectator = world.get_spectator()
+        next_t = time.perf_counter()
         while True:
+            if USE_SYNC_MODE:
+                world.tick()
+                next_t += SYNC_FIXED_DELTA            # pace steps to real time
+                delay = next_t - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    next_t = time.perf_counter()      # slower than real time: no catch-up burst
+            else:
+                time.sleep(0.05)
+
             if FOLLOW_CAMERA and ego.is_alive:
                 tf  = ego.get_transform()
                 fwd = tf.get_forward_vector()
@@ -555,7 +593,6 @@ def main():
                 spectator.set_transform(carla.Transform(
                     cam_loc,
                     carla.Rotation(pitch=-15.0, yaw=tf.rotation.yaw, roll=0.0)))
-            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\nStopping...")
@@ -568,6 +605,13 @@ def main():
                 pass
         if streamer is not None:
             streamer.stop()
+        if original_settings is not None:
+            try:
+                tm.set_synchronous_mode(False)
+                world.apply_settings(original_settings)   # never leave CARLA frozen in sync mode
+                print("[SYNC] world settings restored")
+            except Exception:
+                pass
         print("Destroying actors...")
         for actor in actors_to_destroy:
             try:
