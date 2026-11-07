@@ -1,54 +1,61 @@
 """
 carla_radar_sender.py
 =====================================================================
- CARLA  ->  MATLAB  |  True FMCW MIMO Radar Simulation
+ CARLA  ->  MATLAB  |  Synthetic 77 GHz FMCW MIMO radar data cube
 =====================================================================
 
- MIMO layout  (TI AWR1843-style):
-   numTX = 2  (spacing = numRX * lambda/2)
-   numRX = 4  (half-wavelength spacing)
-   numVirtual = 8  uniform lambda/2 virtual ULA
+ What this script does
+ ---------------------
+  1. Builds a CARLA traffic scene (ego vehicle with autopilot, a lead
+     vehicle, NPC vehicles and AI pedestrians) and attaches CARLA's
+     ray-cast radar sensor to the ego vehicle.
+  2. On every radar tick, filters the CARLA detections and synthesises
+     a complex IQ radar data cube [numVirtual x numADC x numChirps]
+     from them (FMCW beat signal, Doppler phase and per-element
+     spatial phase).
+  3. Streams the raw detections plus the cube to MATLAB over UDP,
+     fragmented into magic-tagged packets.
 
- UDP fragmented protocol  (MAGIC-identified, robust):
- --------------------------------------------------------
-  META packet  (12 bytes):
-    uint32  MAGIC_META  = 0xCAFEBEEF
-    uint32  num_chunks
-    uint32  total_bytes
+ Array model (2 TX x 4 RX -> 8 virtual elements)
+ -----------------------------------------------
+  RX spacing lambda/2, TX spacing 4*lambda/2, giving a uniform
+  8-element virtual ULA at [0, d, ..., 7d], d = lambda/2.
+  NOTE: every virtual channel is synthesised on every chirp (ideal
+  MIMO). TDM transmit scheduling and its time offset are NOT modelled,
+  and the cube carries no elevation phase. See README "Known
+  limitations".
 
-  CHUNK packets  (16 + payload bytes each):
-    uint32  MAGIC_CHUNK = 0xDEADF00D
-    uint32  frame_id
-    uint32  chunk_idx   (0-based)
-    uint32  chunk_len
-    uint8   payload[chunk_len]
+ UDP protocol (all integers little-endian)
+ -----------------------------------------
+  META  packet (12 bytes):
+    uint32 MAGIC_META = 0xCAFEBEEF | uint32 num_chunks | uint32 total_bytes
+  CHUNK packet (16 + chunk_len bytes):
+    uint32 MAGIC_CHUNK = 0xDEADF00D | uint32 frame_id |
+    uint32 chunk_idx (0-based)      | uint32 chunk_len | payload
 
-  Every datagram carries its own magic number so MATLAB can
-  always identify packet type regardless of arrival order.
+  Assembled frame payload:
+    bytes  0-3   uint32  numVirtual
+    bytes  4-7   uint32  numADC
+    bytes  8-11  uint32  numChirps
+    bytes 12-19  double  timestamp (CARLA simulation time, s)
+    bytes 20-23  uint32  numDet
+    bytes 24-    float32 [numDet x 4]  raw detections [vel, az, alt, depth]
+    then         complex64 cube [numVirtual x numADC x numChirps] (C order)
 
- Full frame payload layout  (assembled from chunks):
- --------------------------------------------------------
-  Bytes  0-3    uint32  numVirtual
-  Bytes  4-7    uint32  numADC
-  Bytes  8-11   uint32  numChirps
-  Bytes 12-19   double  timestamp
-  Bytes 20-23   uint32  numDet
-  Bytes 24-24+numDet*16   float32[numDet][4]  [vel,az,alt,dep]
-  Remaining               complex64 IQ cube   [numVirt x numADC x numChirps]
-
-HOW TO RUN
-----------
-  1. Start CARLA simulator
+ How to run
+ ----------
+  1. Start the CARLA simulator (server on localhost:2000)
   2. python carla_radar_sender.py
-  3. Run carla_radar_full_live.m in MATLAB
+  3. Run matlab/carla_radar_full_live.m in MATLAB
 """
 
 import carla
+import csv
 import random
-import time
 import socket
 import struct
-import csv
+import time
+
 import numpy as np
 
 # ---- UDP destination -----------------------------------------------
@@ -62,7 +69,7 @@ RADAR_VERTICAL_FOV      = 10.0
 RADAR_POINTS_PER_SECOND = 1500
 RADAR_SENSOR_TICK       = 0.1
 
-# ---- FMCW MIMO waveform parameters  (77 GHz TI AWR1843-style) ----
+# ---- FMCW MIMO waveform parameters  (77 GHz) ----------------------
 C           = 3e8
 FC          = 77e9
 BW          = 150e6
@@ -77,9 +84,9 @@ NUM_ADC     = 256
 NUM_CHIRPS  = 128
 
 D_RX        = LAMBDA / 2
-D_TX        = NUM_RX * D_RX    # TX spacing = 4 * lambda/2 -> uniform virtual ULA
+D_TX        = NUM_RX * D_RX    # -> uniform lambda/2 virtual ULA
 
-NOISE_SIGMA = 0.05
+NOISE_SIGMA = 0.05             # receiver noise added in Python (MATLAB adds AWGN at SNR_dB on top)
 
 # ---- Detection filter applied before cube synthesis ---------------
 # Same gates as the MATLAB display filter, so the cube and the plots
@@ -93,10 +100,12 @@ MAX_ABS_VEL = 40.0    # m/s
 SLOW_SPEED_LIMIT = 2.0   # m/s  targets slower than this ...
 SLOW_RCS_WEIGHT  = 0.1   #      ... get this amplitude weight (pedestrian-like)
 
-# ---- Protocol magic numbers ---------------------------------------
+# ---- Protocol ------------------------------------------------------
 MAGIC_META  = 0xCAFEBEEF
 MAGIC_CHUNK = 0xDEADF00D
 CHUNK_SIZE  = 60000
+HEADER_FMT  = "<IIIdI"                     # 24 bytes, no padding
+HEADER_BYTES = struct.calcsize(HEADER_FMT)
 
 # ---- Scene settings -----------------------------------------------
 FOLLOW_CAMERA        = True
@@ -110,21 +119,28 @@ WALKER_RUNNING_PROB  = 0.10
 WALKER_CROSSING_PROB = 0.20
 WALKER_SPAWN_TRIES   = 120
 
-# ---- Pre-compute virtual element positions ------------------------
-FS     = NUM_ADC / T_CHIRP
-DT     = 1.0 / FS
-T_AXIS = np.arange(NUM_ADC) * DT                   # [NUM_ADC]
+# ---- Pre-computed axes and array geometry -------------------------
+FS        = NUM_ADC / T_CHIRP
+T_AXIS    = np.arange(NUM_ADC) / FS                 # fast time  [NUM_ADC]
+CHIRP_IDX = np.arange(NUM_CHIRPS)                   # slow time  [NUM_CHIRPS]
 
-RX_POS   = np.arange(NUM_RX) * D_RX                # [4]
-TX_POS   = np.array([0.0, D_TX])                   # [2]
-VIRT_POS = np.array(
-    [tx + rx for tx in TX_POS for rx in RX_POS]
-)                                                   # [8] uniform lambda/2 ULA
-
-frame_id_counter = 0
+RX_POS   = np.arange(NUM_RX) * D_RX                 # [4]
+TX_POS   = np.array([0.0, D_TX])                    # [2]
+VIRT_POS = np.array([tx + rx for tx in TX_POS for rx in RX_POS])   # [8]
 
 
 # -------------------------------------------------------------------
+# Signal model
+# -------------------------------------------------------------------
+def detections_to_array(radar_data):
+    """Copy a CARLA RadarMeasurement into a float32 array [N x 4]
+    with columns [velocity, azimuth_rad, altitude_rad, depth_m]."""
+    return np.array(
+        [[d.velocity, d.azimuth, d.altitude, d.depth] for d in radar_data],
+        dtype=np.float32,
+    ).reshape(-1, 4)
+
+
 def filter_detections(dets):
     """Boolean mask of detections used for the cube: finite,
     forward-facing, MIN_DEPTH <= R <= MAX_DEPTH and
@@ -147,128 +163,101 @@ def amplitude_weights(v, R):
     return rcs * np.sqrt(power)
 
 
-def build_rdc(detections_raw):
+def build_rdc(dets, rng=np.random):
     """
-    Synthesise a true FMCW MIMO Radar Data Cube.
+    Synthesise the FMCW MIMO radar data cube from CARLA detections.
 
-    For each CARLA detection (R, v, az_rad):
-      fr          = 2*R*slope/c              range beat frequency
-      fd          = 2*v*fc/c                 Doppler frequency
-      fbeat       = fr + fd                  total beat frequency
-      phi_spatial = 2pi * d_v(n) * sin(az) / lambda   per virtual element
-      per-chirp Doppler phase = 2pi * fd * chirp_idx * T_CHIRP
+    For each kept detection i (range R, radial velocity v, azimuth az):
+      f_r   = 2 R slope / c          range beat frequency
+      f_d   = 2 v f_c / c            Doppler frequency
+      f_b   = f_r + f_d              beat frequency within a chirp
+      phi_d = 2 pi f_d m T_chirp     slow-time Doppler phase, chirp m
+      phi_s = 2 pi/lambda p_q sin(az)  spatial phase, virtual element q
 
-    Only detections that pass filter_detections() are used, each scaled
-    by its amplitude_weights() value.
+      cube[q, n, m] = sum_i a_i exp(j(2 pi f_b t_n + phi_d + phi_s)) + noise
 
-    Returns
-    -------
-    RDC : np.ndarray  complex64  [NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS]
+    The sum is evaluated as one matrix product instead of a Python
+    loop over detections and elements.
+
+    Returns complex64 array [NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS].
     """
-    RDC = np.zeros((NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS), dtype=np.complex64)
-
-    dets = np.array([[d.velocity, d.azimuth, d.altitude, d.depth]
-                     for d in detections_raw], dtype=np.float64).reshape(-1, 4)
+    dets = np.asarray(dets, dtype=np.float64).reshape(-1, 4)
     dets = dets[filter_detections(dets)]
-    amps = amplitude_weights(dets[:, 0], dets[:, 3]) if len(dets) else []
 
-    for (v, az, _alt, R), amp in zip(dets, amps):
-        fr    = 2.0 * R * SLOPE / C
-        fd    = 2.0 * v * FC    / C
-        fbeat = fr + fd
+    if len(dets):
+        v, az, R = dets[:, 0], dets[:, 1], dets[:, 3]
+        amp = amplitude_weights(v, R)
 
-        # Spatial phase per virtual element  [NUM_VIRTUAL]
-        phi_spatial = (2.0 * np.pi / LAMBDA) * VIRT_POS * np.sin(az)
+        f_d = 2.0 * v * FC / C
+        f_b = 2.0 * R * SLOPE / C + f_d
 
-        # Fast-time envelope  [NUM_ADC]
-        beat_time = np.exp(1j * 2.0 * np.pi * fbeat * T_AXIS)
+        spatial = amp[:, None] * np.exp(
+            1j * (2.0 * np.pi / LAMBDA) * VIRT_POS[None, :] * np.sin(az)[:, None])  # [K, V]
+        fast = np.exp(1j * 2.0 * np.pi * f_b[:, None] * T_AXIS[None, :])          # [K, A]
+        slow = np.exp(1j * 2.0 * np.pi * f_d[:, None] * CHIRP_IDX[None, :] * T_CHIRP)  # [K, C]
 
-        # Chirp loop
-        chirp_idx_arr = np.arange(NUM_CHIRPS)
-        phi_dop_arr   = 2.0 * np.pi * fd * chirp_idx_arr * T_CHIRP  # [NUM_CHIRPS]
+        sv_fast = (spatial[:, :, None] * fast[:, None, :]).reshape(len(dets), -1)  # [K, V*A]
+        rdc = (sv_fast.T @ slow).reshape(NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS)
+    else:
+        rdc = np.zeros((NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS), dtype=np.complex128)
 
-        for v_idx in range(NUM_VIRTUAL):
-            # [NUM_ADC, 1] x [1, NUM_CHIRPS] -> [NUM_ADC, NUM_CHIRPS]
-            sig = amp * beat_time[:, np.newaxis] * np.exp(
-                1j * (phi_dop_arr[np.newaxis, :] + phi_spatial[v_idx])
-            )
-            RDC[v_idx] += sig.astype(np.complex64)
-
-    # Add complex AWGN
     noise = (NOISE_SIGMA / np.sqrt(2.0)) * (
-        np.random.randn(*RDC.shape) + 1j * np.random.randn(*RDC.shape)
-    )
-    RDC += noise.astype(np.complex64)
-
-    return RDC
+        rng.standard_normal(rdc.shape) + 1j * rng.standard_normal(rdc.shape))
+    return (rdc + noise).astype(np.complex64)
 
 
-def send_frame(sock, detections_raw, timestamp):
-    """
-    Build full frame payload and send as magic-identified fragments.
-    """
-    global frame_id_counter
+# -------------------------------------------------------------------
+# UDP transport
+# -------------------------------------------------------------------
+def build_payload(dets, timestamp):
+    """Header + raw detections + IQ cube, as one bytes object."""
+    dets = np.asarray(dets, dtype=np.float32).reshape(-1, 4)
+    header = struct.pack(HEADER_FMT, NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS,
+                         float(timestamp), len(dets))
+    det_bytes = dets.astype("<f4").tobytes()
+    cube_bytes = build_rdc(dets).astype("<c8").tobytes()
+    return header + det_bytes + cube_bytes
 
-    num_det = len(detections_raw)
 
-    # Raw detection bytes  [vel, az, alt, dep]  float32 x4
-    det_bytes = bytearray()
-    for det in detections_raw:
-        det_bytes += struct.pack("<ffff",
-            float(det.velocity), float(det.azimuth),
-            float(det.altitude), float(det.depth))
-
-    # Build IQ cube
-    RDC = build_rdc(detections_raw)   # [NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS]
-    rdc_bytes = RDC.astype(np.complex64).tobytes()
-
-    # Fixed header  (28 bytes)
-    header = struct.pack("<IIIdI",
-        NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS, timestamp, num_det)
-
-    payload = bytes(header) + bytes(det_bytes) + rdc_bytes
-    total   = len(payload)
-
+def send_frame(sock, dets, timestamp, frame_id):
+    """Send one frame as a META packet followed by CHUNK packets."""
+    payload = build_payload(dets, timestamp)
+    total = len(payload)
     num_chunks = (total + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    # Send META packet
-    meta_pkt = struct.pack("<III", MAGIC_META, num_chunks, total)
-    sock.sendto(meta_pkt, (MATLAB_IP, MATLAB_PORT))
+    sock.sendto(struct.pack("<III", MAGIC_META, num_chunks, total),
+                (MATLAB_IP, MATLAB_PORT))
     time.sleep(0.001)
 
-    # Send CHUNK packets
-    fid = frame_id_counter & 0xFFFFFFFF
+    fid = frame_id & 0xFFFFFFFF
     for i in range(num_chunks):
-        chunk_data = payload[i * CHUNK_SIZE : (i+1) * CHUNK_SIZE]
-        c_len      = len(chunk_data)
-        chunk_hdr  = struct.pack("<IIII", MAGIC_CHUNK, fid, i, c_len)
-        sock.sendto(chunk_hdr + chunk_data, (MATLAB_IP, MATLAB_PORT))
-        time.sleep(0.0002)
+        chunk = payload[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]
+        hdr = struct.pack("<IIII", MAGIC_CHUNK, fid, i, len(chunk))
+        sock.sendto(hdr + chunk, (MATLAB_IP, MATLAB_PORT))
+        time.sleep(0.0002)   # pacing so the loopback receive buffer is not overrun
 
-    frame_id_counter += 1
+
+frame_id_counter = 0
 
 
 def radar_callback(radar_data, sock, csv_writer=None):
-    detections = list(radar_data)
-    send_frame(sock, detections, radar_data.timestamp)
+    """CARLA sensor callback: build and send one frame, then log it."""
+    global frame_id_counter
+    ts = float(radar_data.timestamp)
+    dets = detections_to_array(radar_data)
+    send_frame(sock, dets, ts, frame_id_counter)
+    frame_id_counter += 1
 
     if csv_writer is not None:
-        for det in detections:
-            csv_writer.writerow([
-                radar_data.timestamp, len(detections),
-                float(det.velocity), float(det.azimuth),
-                float(det.altitude), float(det.depth)])
+        for v, az, alt, dep in dets:
+            csv_writer.writerow([ts, len(dets), v, az, alt, dep])
 
-    if detections:
-        nearest  = min(d.depth    for d in detections)
-        min_vel  = min(d.velocity for d in detections)
-        max_vel  = max(d.velocity for d in detections)
-        mean_vel = sum(d.velocity for d in detections) / len(detections)
-        print(f"[Radar] t={radar_data.timestamp:.2f}s | "
-              f"pts={len(detections)} | nearest={nearest:.2f}m | "
-              f"vel=[{min_vel:.2f}, {max_vel:.2f}] | mean={mean_vel:.2f} m/s")
+    if len(dets):
+        v, dep = dets[:, 0], dets[:, 3]
+        print(f"[Radar] t={ts:.2f}s | pts={len(dets)} | nearest={dep.min():.2f}m | "
+              f"vel=[{v.min():.2f}, {v.max():.2f}] | mean={v.mean():.2f} m/s")
     else:
-        print(f"[Radar] t={radar_data.timestamp:.2f}s | pts=0")
+        print(f"[Radar] t={ts:.2f}s | pts=0")
 
 
 # ---- Scene helpers -------------------------------------------------
@@ -383,6 +372,7 @@ def spawn_walkers(world, blueprint_library, count):
 
 def main():
     actors_to_destroy = []
+    radar = None
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -502,6 +492,11 @@ def main():
         print("\nStopping...")
 
     finally:
+        if radar is not None:
+            try:
+                radar.stop()
+            except Exception:
+                pass
         print("Destroying actors...")
         for actor in actors_to_destroy:
             try:
