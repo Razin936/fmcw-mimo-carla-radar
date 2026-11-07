@@ -61,7 +61,8 @@ d_rx       = lambda / 2;
 d_tx       = numRX * d_rx;
 rx_pos     = (0:numRX-1).' * d_rx;
 tx_pos     = [0; d_tx];
-virt_pos   = reshape(bsxfun(@plus, tx_pos, rx_pos.'), [], 1);  % [8x1]
+% Channel order must match the cube: (tx0,rx0..rx3), (tx1,rx0..rx3)
+virt_pos   = reshape(rx_pos + tx_pos.', [], 1);   % [0 d 2d ... 7d]
 
 dR   = c  / (2*BW);
 Vmax = lambda / (4*T);
@@ -76,13 +77,14 @@ V_ax = linspace(-Vmax, Vmax, numChirps);
 
 % Azimuth steering matrix  [numVirt x 181]
 ang_ax = (-90:1:90).';
-steer_az = exp(-1j * 2*pi/lambda * virt_pos * sind(ang_ax.'));
+% Sign follows the sender's model x_q = s*exp(+j*2*pi/lambda*p_q*sin(theta))
+steer_az = exp(+1j * 2*pi/lambda * virt_pos * sind(ang_ax.'));
 
 % Elevation axis + steering matrix  [numRX x 61]  -- FROM V5
 el_ax  = (-30:1:30).';
 d_el   = lambda / 2;
 el_idx = (0:numRX-1).';
-steer_el = exp(-1j * 2*pi/lambda * d_el * el_idx * sind(el_ax.'));
+steer_el = exp(+1j * 2*pi/lambda * d_el * el_idx * sind(el_ax.'));
 
 fprintf('FMCW MIMO Radar Parameters\n');
 fprintf('  fc=%g GHz  BW=%g MHz  T=%g us  slope=%.2f MHz/us\n', ...
@@ -513,7 +515,7 @@ while all(isvalid(allFigs))
     %% Step 13: Fig 4 - Range-Azimuth using dominant Doppler bin  -- FROM V5
     [~, dom_dop_bin] = max(max(abs(RDM), [], 1));
     virt_snap = squeeze(rangeFFT(:, dom_dop_bin, :));  % [numADC x numVirt]
-    ra_map = abs(virt_snap * steer_az);                % [numADC x 181]
+    ra_map = abs(virt_snap * conj(steer_az));          % [numADC x 181]
     ra_dB  = 20*log10(ra_map ./ (max(ra_map(:)) + eps));
     set(hi_ra, 'CData', ra_dB);
     title(ax4, sprintf('FFT Range-Azimuth  |  %d virtual elements', numVirt), ...
