@@ -112,6 +112,13 @@ W_train(numTrain+1:numTrain+guardW, numTrain+1:numTrain+guardW) = 0;
 
 J_virt = fliplr(eye(numVirt));                   % forward-backward exchange matrix
 
+%% ---- Display rate ---------------------------------------------------------
+% Redrawing ten windows is the slowest part on a laptop and shares the GPU
+% with CARLA. MATLAB processes and shows at most DISPLAY_FPS frames per
+% second, stays idle in between and then continues with the newest frame.
+% Raise it on a fast PC (10 = every CARLA frame).
+DISPLAY_FPS = 2;
+
 %% ---- UDP setup -----------------------------------------------------------
 UDP_PORT     = 5005;
 CHUNK_SIZE   = 60000;
@@ -522,6 +529,15 @@ while all(isvalid(allFigs))
              ' | rx %4.0f ms  dsp %4.0f ms  draw %4.0f ms\n'], ...
             frameCount, timestamp, numel(vel_raw), K, numTar, flush_count, fps, ...
             1000*t_rx, 1000*t_dsp, 1000*t_draw);
+
+    % Display cap: idle until the next display slot, then drop the frames
+    % that arrived meanwhile (intentional, not counted as backlog).
+    idle_s = 1/DISPLAY_FPS - toc(t_frame);
+    if idle_s > 0
+        pause(idle_s);
+        flush(u, "input");
+        prebuf = {};
+    end
 end
 
 disp('A figure was closed.  Radar stopped.');
