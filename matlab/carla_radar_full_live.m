@@ -498,9 +498,14 @@ while all(isvalid(allFigs))
     cfar_mask(end-border+1:end, :)   = 0;
     cfar_mask(:, 1:border)           = 0;
     cfar_mask(:, end-border+1:end)   = 0;
+    cfar_mask(R_ax > MAX_DEPTH + 2*dR, :) = 0;   % beyond the sensor range: noise only
 
     set(hi_cfar, 'CData', double(cfar_mask));
-    [cfar_r_all, cfar_d_all] = find(cfar_mask);
+    % Rank cells by power so cluster suppression keeps each cluster's peak
+    % and the MAX_TAR strongest targets are passed to CBF / MUSIC.
+    det_idx = find(cfar_mask);
+    [~, order] = sort(RDM_pow(det_idx), 'descend');
+    [cfar_r_all, cfar_d_all] = ind2sub(size(cfar_mask), det_idx(order));
     [cfar_r, cfar_d] = remove_close_detections(cfar_r_all, cfar_d_all, 5);
     K = numel(cfar_r);
     title(ax3, sprintf('CA-CFAR (conv2)  |  %d detections', K), 'Color','w');
