@@ -81,6 +81,18 @@ D_TX        = NUM_RX * D_RX    # TX spacing = 4 * lambda/2 -> uniform virtual UL
 
 NOISE_SIGMA = 0.05
 
+# ---- Detection filter applied before cube synthesis ---------------
+# Same gates as the MATLAB display filter, so the cube and the plots
+# are built from the same set of detections.
+MIN_DEPTH   = 4.0     # m   removes near-field self-returns
+MAX_DEPTH   = 60.0    # m
+MIN_ABS_VEL = 0.5     # m/s removes static returns (|v| <= MIN_ABS_VEL)
+MAX_ABS_VEL = 40.0    # m/s
+
+# ---- Heuristic reflectivity (CARLA provides no RCS) ---------------
+SLOW_SPEED_LIMIT = 2.0   # m/s  targets slower than this ...
+SLOW_RCS_WEIGHT  = 0.1   #      ... get this amplitude weight (pedestrian-like)
+
 # ---- Protocol magic numbers ---------------------------------------
 MAGIC_META  = 0xCAFEBEEF
 MAGIC_CHUNK = 0xDEADF00D
@@ -113,6 +125,28 @@ frame_id_counter = 0
 
 
 # -------------------------------------------------------------------
+def filter_detections(dets):
+    """Boolean mask of detections used for the cube: finite,
+    forward-facing, MIN_DEPTH <= R <= MAX_DEPTH and
+    MIN_ABS_VEL < |v| <= MAX_ABS_VEL."""
+    v, az, R = dets[:, 0], dets[:, 1], dets[:, 3]
+    finite = np.isfinite(dets).all(axis=1)
+    with np.errstate(invalid="ignore"):
+        forward = R * np.cos(az) >= 0.0
+        return (finite & forward
+                & (R >= MIN_DEPTH) & (R <= MAX_DEPTH)
+                & (np.abs(v) > MIN_ABS_VEL) & (np.abs(v) <= MAX_ABS_VEL))
+
+
+def amplitude_weights(v, R):
+    """Voltage amplitude per detection: heuristic RCS weight times the
+    square root of an R^-4 power factor normalised to the nearest target."""
+    rcs = np.where(np.abs(v) < SLOW_SPEED_LIMIT, SLOW_RCS_WEIGHT, 1.0)
+    power = R ** -4.0
+    power = power / power.max()
+    return rcs * np.sqrt(power)
+
+
 def build_rdc(detections_raw):
     """
     Synthesise a true FMCW MIMO Radar Data Cube.
@@ -124,20 +158,21 @@ def build_rdc(detections_raw):
       phi_spatial = 2pi * d_v(n) * sin(az) / lambda   per virtual element
       per-chirp Doppler phase = 2pi * fd * chirp_idx * T_CHIRP
 
+    Only detections that pass filter_detections() are used, each scaled
+    by its amplitude_weights() value.
+
     Returns
     -------
     RDC : np.ndarray  complex64  [NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS]
     """
     RDC = np.zeros((NUM_VIRTUAL, NUM_ADC, NUM_CHIRPS), dtype=np.complex64)
 
-    for det in detections_raw:
-        R  = float(det.depth)
-        v  = float(det.velocity)
-        az = float(det.azimuth)   # radians
+    dets = np.array([[d.velocity, d.azimuth, d.altitude, d.depth]
+                     for d in detections_raw], dtype=np.float64).reshape(-1, 4)
+    dets = dets[filter_detections(dets)]
+    amps = amplitude_weights(dets[:, 0], dets[:, 3]) if len(dets) else []
 
-        if R < 1.0 or R > RADAR_RANGE:
-            continue
-
+    for (v, az, _alt, R), amp in zip(dets, amps):
         fr    = 2.0 * R * SLOPE / C
         fd    = 2.0 * v * FC    / C
         fbeat = fr + fd
@@ -154,7 +189,7 @@ def build_rdc(detections_raw):
 
         for v_idx in range(NUM_VIRTUAL):
             # [NUM_ADC, 1] x [1, NUM_CHIRPS] -> [NUM_ADC, NUM_CHIRPS]
-            sig = beat_time[:, np.newaxis] * np.exp(
+            sig = amp * beat_time[:, np.newaxis] * np.exp(
                 1j * (phi_dop_arr[np.newaxis, :] + phi_spatial[v_idx])
             )
             RDC[v_idx] += sig.astype(np.complex64)
