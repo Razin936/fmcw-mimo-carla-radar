@@ -127,7 +127,7 @@ CHUNK_SIZE  = 60000;
 MAGIC_META  = uint32(hex2dec('CAFEBEEF'));
 MAGIC_CHUNK = uint32(hex2dec('DEADF00D'));
 
-HEADER_BYTES = 28;   % 4+4+4+8+4
+HEADER_BYTES = 24;   % uint32 x3 + double + uint32  (struct "<IIIdI")
 CUBE_BYTES   = numVirt * numADC * numChirps * 8;  % complex64
 
 try
@@ -259,6 +259,8 @@ allFigs    = [f1 f2 f3 f4 f5 f6 f7 f8 f9 f10];
 frameCount = 0;
 noise_floor_db = -60;
 last_wall_t    = tic;   % for FPS tracking  -- FROM V5
+last_num_chunks = 0;
+prebuf          = {};    % datagrams already read but not yet used
 
 %% ---- Pre-compute Hann windows (no Signal Processing Toolbox needed) -
 n_range     = (0:numADC-1).';
@@ -272,93 +274,33 @@ win2d       = win_range * win_doppler;   % [numADC x numChirps]
 %% ==================================================================
 while all(isvalid(allFigs))
 
-    frame_start = tic;   % budget timer  -- FROM V5
+    t_frame = tic;
 
-    %% Step 1: Wait for META packet (magic = 0xCAFEBEEF) -------------
-    %
-    %  META  (12 bytes): [uint32 MAGIC_META | uint32 num_chunks | uint32 total_bytes]
-    %  CHUNK (>=16 bytes): [uint32 MAGIC_CHUNK | uint32 frame_id |
-    %                       uint32 chunk_idx(0-based) | uint32 chunk_len | payload]
-
-    got_meta    = false;
-    num_chunks  = 0;
-    total_bytes = 0;
-    t_meta      = tic;
-
-    while ~got_meta && toc(t_meta) < 3.0
-        if u.NumDatagramsAvailable <= 0
-            pause(0.005);
-            continue;
-        end
-        dg  = read(u, 1, "uint8");
-        dgd = uint8(dg.Data);
-        if numel(dgd) < 12
-            continue;
-        end
-        magic = typecast(dgd(1:4), 'uint32');
-        if magic ~= MAGIC_META
-            continue;
-        end
-        num_chunks  = double(typecast(dgd(5:8),  'uint32'));
-        total_bytes = double(typecast(dgd(9:12), 'uint32'));
-        if num_chunks >= 1 && total_bytes >= HEADER_BYTES
-            got_meta = true;
-        end
+    %% Step 1: backlog check ----------------------------------------------
+    % If two or more complete frames are already queued, MATLAB has fallen
+    % behind: drop the whole input queue and resynchronise on the next
+    % META packet. flush_count reports what was discarded for this frame
+    % (0 = keeping up in real time).
+    flush_count = 0;
+    pending = u.NumDatagramsAvailable + numel(prebuf);
+    if last_num_chunks > 0 && pending >= 2*(last_num_chunks + 1)
+        flush(u, "input");
+        prebuf = {};
+        flush_count = pending;
     end
 
-    if ~got_meta
+    %% Step 2: receive one complete frame (META + all CHUNKs of one ID) ---
+    [assembled, num_chunks, dropped, prebuf] = receive_frame(u, prebuf, MAGIC_META, ...
+        MAGIC_CHUNK, CHUNK_SIZE, HEADER_BYTES, 1.0);
+    t_rx = toc(t_frame);
+    flush_count = flush_count + dropped;
+    if isempty(assembled)
+        drawnow limitrate;
         continue;
     end
+    last_num_chunks = num_chunks;
 
-    %% Step 2: Collect all chunks for this frame ----------------------
-    assembled = zeros(total_bytes, 1, 'uint8');
-    received  = false(num_chunks, 1);
-    t_wait    = tic;
-
-    while ~all(received) && toc(t_wait) < 3.0
-        if u.NumDatagramsAvailable <= 0
-            pause(0.001);
-            continue;
-        end
-        dg  = read(u, 1, "uint8");
-        dgd = uint8(dg.Data);
-
-        if numel(dgd) < 16
-            continue;
-        end
-
-        magic = typecast(dgd(1:4), 'uint32');
-        if magic ~= MAGIC_CHUNK
-            continue;
-        end
-
-        c_idx = double(typecast(dgd(9:12),  'uint32')) + 1;  % 1-based
-        c_len = double(typecast(dgd(13:16), 'uint32'));
-
-        if c_idx < 1 || c_idx > num_chunks || c_len < 1
-            continue;
-        end
-        if numel(dgd) < 16 + c_len
-            continue;
-        end
-
-        payload    = dgd(17 : 16 + c_len);
-        start_byte = (c_idx - 1) * CHUNK_SIZE + 1;
-        end_byte   = start_byte + c_len - 1;
-
-        if end_byte <= total_bytes
-            assembled(start_byte : end_byte) = payload;
-            received(c_idx) = true;
-        end
-    end
-
-    if ~all(received)
-        warning('Incomplete frame (%d/%d chunks). Skipping.', ...
-                sum(received), num_chunks);
-        continue;
-    end
-
-    %% Step 3: Parse fixed header (28 bytes) --------------------------
+    %% Step 3: Parse fixed header (24 bytes) --------------------------
     if numel(assembled) < HEADER_BYTES
         warning('Frame too short for header. Skipping.');
         continue;
@@ -440,7 +382,6 @@ while all(isvalid(allFigs))
     end
 
     %% Step 7: RCS weighting + path loss  -- FROM V5 -----------------
-    flush_count = 0;   % not applicable in chunked protocol but kept for info panel
     if ~isempty(dep_raw)
         rcs_weight            = ones(size(dep_raw));
         rcs_weight(abs(vel_raw) < 2.0) = 0.1;
@@ -653,10 +594,15 @@ while all(isvalid(allFigs))
                 frameCount, dR, dV, Vmax, numVirt, noise_floor_db, SNR_dB, flush_count);
 
     frameCount = frameCount + 1;
-    fprintf('Frame %3d | t=%7.2f | pts=%3d | CFAR=%2d | MUSIC=%d | %.1f fps\n', ...
-            frameCount, timestamp, numel(vel_raw), K, numTar, fps);
-
+    t_dsp = toc(t_frame) - t_rx;
+    t_draw0 = tic;
     drawnow limitrate;
+    t_draw = toc(t_draw0);
+
+    fprintf(['Frame %3d | t=%7.2f | pts=%3d | CFAR=%2d | MUSIC=%d | flushed=%d | %.1f fps' ...
+             ' | rx %4.0f ms  dsp %4.0f ms  draw %4.0f ms\n'], ...
+            frameCount, timestamp, numel(vel_raw), K, numTar, flush_count, fps, ...
+            1000*t_rx, 1000*t_dsp, 1000*t_draw);
 end
 
 disp('A figure was closed.  Radar stopped.');
@@ -665,6 +611,83 @@ clear u;
 %% ==================================================================
 %% LOCAL HELPER FUNCTIONS
 %% ==================================================================
+
+function [assembled, num_chunks, dropped, prebuf] = receive_frame(u, prebuf, MAGIC_META, ...
+        MAGIC_CHUNK, CHUNK_SIZE, HEADER_BYTES, timeout_s)
+% Reassemble one frame: a META packet followed by all CHUNK packets that
+% carry the same frame_id. Datagrams are read from the port in batches
+% (one read call for everything queued); unused ones are returned in
+% 'prebuf' for the next frame. Returns [] on timeout. 'dropped' counts the
+% datagrams discarded on the way (stale chunks, chunks of another frame,
+% duplicates, frames abandoned because a newer META arrived).
+    assembled = [];
+    num_chunks = 0;
+    dropped = 0;
+    have_meta = false;
+    t0 = tic;
+
+    while toc(t0) < timeout_s
+        if isempty(prebuf)
+            n_avail = u.NumDatagramsAvailable;
+            if n_avail <= 0
+                pause(0.001);
+                continue;
+            end
+            dgs    = read(u, n_avail, "uint8");
+            prebuf = {dgs.Data};
+        end
+        dgd = uint8(prebuf{1});
+        prebuf(1) = [];
+        if numel(dgd) < 12
+            dropped = dropped + 1;
+            continue;
+        end
+        magic = typecast(dgd(1:4), 'uint32');
+
+        if magic == MAGIC_META
+            n_c = double(typecast(dgd(5:8),  'uint32'));
+            tot = double(typecast(dgd(9:12), 'uint32'));
+            if have_meta
+                dropped = dropped + sum(received);     % abandon the unfinished frame
+            end
+            if tot < HEADER_BYTES || n_c ~= ceil(tot / CHUNK_SIZE)
+                have_meta = false;
+                dropped = dropped + 1;
+                continue;
+            end
+            have_meta  = true;
+            num_chunks = n_c;
+            buf        = zeros(tot, 1, 'uint8');
+            received   = false(n_c, 1);
+            frame_id   = [];
+            t0 = tic;                                  % fresh timeout for this frame
+
+        elseif magic == MAGIC_CHUNK && have_meta && numel(dgd) >= 16
+            fid   = typecast(dgd(5:8),   'uint32');
+            c_idx = double(typecast(dgd(9:12),  'uint32')) + 1;
+            c_len = double(typecast(dgd(13:16), 'uint32'));
+            if isempty(frame_id)
+                frame_id = fid;                        % lock onto this frame
+            end
+            s_byte = (c_idx - 1) * CHUNK_SIZE + 1;
+            e_byte = s_byte + c_len - 1;
+            if fid ~= frame_id || c_idx < 1 || c_idx > num_chunks || c_len < 1 ...
+                    || numel(dgd) < 16 + c_len || e_byte > numel(buf) || received(c_idx)
+                dropped = dropped + 1;
+                continue;
+            end
+            buf(s_byte:e_byte) = dgd(17:16+c_len);
+            received(c_idx) = true;
+            if all(received)
+                assembled = buf;
+                return;
+            end
+
+        else
+            dropped = dropped + 1;                     % chunk without META, or junk
+        end
+    end
+end
 
 function style_ax(ax)
     set(ax,'Color','k','XColor','w','YColor','w', ...
