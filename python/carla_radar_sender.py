@@ -370,9 +370,8 @@ def setup_vehicle_behavior(vehicle, tm, is_ego=False):
         pass
 
 
-def spawn_lead_vehicle(world, blueprint_library, vehicle_bps, tm,
-                       ego_vehicle, distance_m=25.0,
-                       min_clearance_m=10.0, max_tries=10):
+def spawn_lead_vehicle(world, vehicle_bps, tm, ego_vehicle,
+                       distance_m=25.0, min_clearance_m=10.0, max_tries=10):
     carla_map = world.get_map()
     ego_loc   = ego_vehicle.get_transform().location
     wp = carla_map.get_waypoint(
@@ -487,7 +486,7 @@ def main():
         # Lead vehicle
         if SPAWN_LEAD_VEHICLE:
             lead = spawn_lead_vehicle(
-                world, blueprint_library, vehicle_bps, tm, ego,
+                world, vehicle_bps, tm, ego,
                 distance_m=LEAD_DISTANCE_METERS,
                 min_clearance_m=LEAD_MIN_CLEARANCE)
             if lead:
@@ -511,14 +510,15 @@ def main():
 
         # Walkers
         if SPAWN_WALKERS:
+            try:
+                # carla.World method; must be set before the walkers are spawned
+                world.set_pedestrians_cross_factor(WALKER_CROSSING_PROB)
+            except Exception:
+                pass
             walkers, controllers = spawn_walkers(
                 world, blueprint_library, NUM_WALKERS)
             actors_to_destroy.extend(controllers)
             actors_to_destroy.extend(walkers)
-            try:
-                tm.set_pedestrians_cross_factor(WALKER_CROSSING_PROB)
-            except Exception:
-                pass
 
         # Radar sensor
         radar_bp = blueprint_library.find("sensor.other.radar")
@@ -551,8 +551,7 @@ def main():
                 tf  = ego.get_transform()
                 fwd = tf.get_forward_vector()
                 cam_loc = tf.location - carla.Location(
-                    x=8.0*fwd.x, y=8.0*fwd.y, z=-4.0)
-                cam_loc.z += 4.0
+                    x=8.0 * fwd.x, y=8.0 * fwd.y, z=-4.0)   # 8 m behind, 4 m above
                 spectator.set_transform(carla.Transform(
                     cam_loc,
                     carla.Rotation(pitch=-15.0, yaw=tf.rotation.yaw, roll=0.0)))
