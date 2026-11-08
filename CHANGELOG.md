@@ -29,6 +29,15 @@ Changes since the initial version **`v0.1.0`**.
   - Removed the amplitude-weighting code that was computed but never used; it now lives in the Python sender.
   - Replaced `physconst`, so no toolbox is needed.
 
+### v2 and v3 pipelines
+
+The v1 files stay unchanged; v2 and v3 are separate sender/receiver pairs.
+
+- **v2 sender: correct radial velocities.** CARLA's radar counted the ego velocity twice, because a 0.1 s sensor tick met 0.05 s simulation steps. The radar now scans every step and every second scan is sent (still 10 frames/s).
+- **v2 receiver: every frame processed.** The full chain runs on every frame; only the redraw is limited. The share of processed frames is measured and shown. Empty frames stay dark instead of showing noise as a 0 dB signal.
+- **v3: TDM-MIMO.** The transmitters take turns in every chirp loop. The velocity axis uses the loop time, and the receiver compensates the motion-induced phase between the transmitters.
+- **v3: elevation.** An optional third transmitter λ/2 above the array adds a second row of virtual elements. Fig 9 estimates elevation from it; in CARLA the estimate was within about 0.3° of the altitude angle.
+
 ### Python sender (`python/carla_radar_sender.py`)
 
 - **Detection filter.** The filter (4–60 m, 0.5 < |v| ≤ 40 m/s, forward-facing) is now applied *before* the cube is built. Previously every detection from 1–60 m went into the cube, including static returns.

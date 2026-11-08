@@ -17,9 +17,13 @@ flowchart LR
 | Path | What it is |
 |---|---|
 | `python/carla_radar_sender.py` | CARLA scene, detection filter, data-cube synthesis, UDP sender |
+| `python/carla_radar_sender_v2.py` | Same, with correct radial velocities (see [Versions of the pipeline](#versions-of-the-pipeline)) |
+| `python/carla_radar_sender_v3.py` | v2 plus TDM-MIMO and an elevation transmitter |
 | `python/cut_in_demo.py` | Scripted cut-in scene for demonstrations and screen recordings |
 | `python/test_sender.py` | Offline checks for the sender (no CARLA needed) |
 | `matlab/carla_radar_full_live.m` | UDP receiver and the full radar signal processing chain |
+| `matlab/carla_radar_full_live_v2.m` | Same chain, run on every frame; matches sender v2 |
+| `matlab/carla_radar_full_live_v3.m` | v2 plus TDM compensation and elevation MUSIC; matches sender v3 |
 | `CHANGELOG.md` | What changed since the initial version |
 
 ## Requirements
@@ -85,7 +89,43 @@ python test_sender.py
 
 This compares the vectorised cube with a plain reference loop, checks the filters and weights, and runs a UDP loopback round trip plus a threading test.
 
+## Versions of the pipeline
+
+Each Python sender has a matching MATLAB receiver. Run them as a pair, the same way as in the quick start.
+
+| Pair | Sender / receiver | What it adds |
+|---|---|---|
+| v1 | `carla_radar_sender.py` / `carla_radar_full_live.m` | The base pipeline described below |
+| v2 | `carla_radar_sender_v2.py` / `carla_radar_full_live_v2.m` | Correct radial velocities; every frame is processed |
+| v3 | `carla_radar_sender_v3.py` / `carla_radar_full_live_v3.m` | v2 plus TDM-MIMO and elevation |
+
+**v2: correct velocities.** CARLA's radar computes its own velocity from the distance it moved since its last scan, divided by one simulation step. With a 0.1 s sensor tick and 0.05 s steps, the ego velocity is counted twice: in v1, static objects appear at −2 × ego speed. v2 lets the radar scan on every step and sends every second scan, so MATLAB still gets 10 frames per second.
+
+**v2: every frame processed.** The MATLAB receiver runs the whole chain on every frame and only limits how often the ten windows are redrawn (`DISPLAY_FPS`). The log shows the share of frames processed; on a laptop that also runs CARLA it is 100 %, at about 20 ms per frame.
+
+**v3: TDM.** The transmitters take turns within every chirp loop, so each one is revisited every *N*<sub>TX</sub> × *T*<sub>c</sub>. The maximum velocity becomes λ / (4 *N*<sub>TX</sub> *T*<sub>c</sub>). The receiver removes the motion-induced phase between the transmitters before angle estimation (`TDM_COMPENSATE`).
+
+**v3: elevation.** With `ENABLE_ELEVATION_TX = True` (Python) and `true` (MATLAB), a third transmitter sits λ/2 above the array, between TX0 and TX1:
+
+```
+height d   .   .   T2  .   .   .   .   .        TX2 row: virtual elements at x = 2d..5d
+height 0   T0  .   .   .   T1  .   .   .        TX0, TX1: 8-element azimuth ULA, x = 0..7d
+```
+
+The 8-element azimuth array stays the same; the phase between the two rows gives the elevation angle (Fig 9). Both switches must have the same value.
+
+| | v1 / v2 | v3, 2 TX | v3, 3 TX (default) |
+|---|---|---|---|
+| Transmitters / virtual channels | 2 / 8 | 2 / 8 | 3 / 12 |
+| Chirp timing | all channels on every chirp | TDM | TDM |
+| Max. velocity / velocity resolution | 97.3 / 1.52 m/s | 48.7 / 0.76 m/s | 32.5 / 0.51 m/s |
+| Elevation | no | no | yes |
+
+In CARLA, v3 estimated elevation within about 0.3° of CARLA's altitude angle and processed 92–97 % of the frames on a laptop, at about 30 ms per frame. Occasional long redraws while CARLA uses the GPU cause the missing frames; a lower `DISPLAY_FPS` reduces them.
+
 ## Radar configuration
+
+Values for v1 and v2; see the table above for v3.
 
 | Parameter | Value |
 |---|---|
@@ -124,13 +164,14 @@ The receiver handles bad or late packets as follows:
 ## Known limitations
 
 - **Synthetic signal model.** The cube is built from CARLA's ray-cast detections using ideal complex exponentials. It has no oscillator phase noise, no multipath and no physical radar cross-section; reflectivity is a heuristic weight (0.1 for targets slower than 2 m/s) times an R⁻⁴ power factor. The angle results therefore depend on this signal and array model.
-- **No TDM timing.** All eight virtual channels are synthesised on every chirp, as in an ideal MIMO radar. Time-division transmit scheduling, its velocity-dependent phase error and the halved maximum velocity are **not** simulated.
-- **No elevation.** The cube carries azimuth phase only, and the four RX elements lie on the azimuth line. The panel *Fig 9 – RX sub-array MUSIC* is a placeholder and does **not** measure elevation. Real elevation estimation needs a 2-D (for example uniform rectangular) array. The 3-D point cloud uses CARLA's own altitude angle.
+- **TDM and elevation only in v3.** In v1 and v2, all eight virtual channels are synthesised on every chirp, as in an ideal MIMO radar, and the cube carries azimuth phase only. Their *Fig 9* is a placeholder and does **not** measure elevation. v3 adds both (see [Versions of the pipeline](#versions-of-the-pipeline)). Its elevation uses two rows λ/2 apart, so it estimates one target per range-Doppler cell well but cannot separate two targets in the same cell by elevation.
+- **Velocities in v1.** v1 counts the ego velocity twice in the radial velocities (see v2 above). Range and angles are not affected.
+- **Static-return filter.** All versions drop detections with |radial velocity| ≤ 0.5 m/s. This removes static objects only while the ego vehicle stands still. While driving, static objects pass the filter and a vehicle moving at the ego speed is removed. Filtering on ground speed (radial velocity plus the ego motion) would fix this.
 
 ## Versions
 
 - `v0.1.0`: the initial version.
-- `v1.0.0`: angle-estimation fix, Python and MATLAB brought in line with each other, faster receiver and sender, documentation.
+- `v1.0.0`: angle-estimation fix, Python and MATLAB brought in line with each other, faster receiver and sender, documentation, cut-in demo, and the v2 and v3 pipelines.
 
 Every change is a separate commit; [CHANGELOG.md](CHANGELOG.md) summarises them.
 
