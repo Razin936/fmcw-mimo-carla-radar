@@ -24,7 +24,6 @@ flowchart LR
 | `matlab/carla_radar_full_live.m` | UDP receiver and the full radar signal processing chain |
 | `matlab/carla_radar_full_live_v2.m` | Same chain, run on every frame; matches sender v2 |
 | `matlab/carla_radar_full_live_v3.m` | v2 plus TDM compensation and elevation MUSIC; matches sender v3 |
-| `VERSIONS.md` | One-page overview of v1, v2 and v3 |
 | `CHANGELOG.md` | What changed since the initial version |
 
 ## Requirements
